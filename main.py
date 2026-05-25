@@ -27,8 +27,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MAX_UPLOAD_SIZE = 10 * 1024 * 1024  # 10MB limit
-
 
 def format_error_svg(msg):
     return f'<svg xmlns="http://www.w3.org/2000/svg"><text x="10" y="20">{msg}</text></svg>'
@@ -45,59 +43,55 @@ async def generate(
     target_w_mm: float = Form(...),
     target_h_mm: float = Form(...)
 ):
+
     start_time = time.time()
 
+    img = None
+    nparr = None
+    contents = None
+    paths = None
+
     try:
-        # -----------------------------
-        # 1. Read file safely (limit memory spike)
-        # -----------------------------
+        # -------------------------
+        # Load image
+        # -------------------------
         contents = await file.read()
-
-        if len(contents) > MAX_UPLOAD_SIZE:
-            return JSONResponse(
-                {"gcode": "", "svg": format_error_svg("File too large")},
-                status_code=413
-            )
-
         nparr = np.frombuffer(contents, np.uint8)
-        contents = None  # free raw buffer early
+        contents = None
 
         img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
-        nparr = None  # free memory
+        del nparr
 
         if img is None:
             return JSONResponse({"gcode": "", "svg": format_error_svg("Invalid image")}, status_code=400)
 
-        # -----------------------------
-        # 2. Resize early (big memory saver)
-        # -----------------------------
+        # -------------------------
+        # Resize (no quality loss in grayscale processing)
+        # -------------------------
         h, w = img.shape
-        max_dim = MAX_IMAGE_DIMENSION
-
-        if max(h, w) > max_dim:
-            scale = max_dim / max(h, w)
+        if max(h, w) > MAX_IMAGE_DIMENSION:
+            scale = MAX_IMAGE_DIMENSION / max(h, w)
             img = cv2.resize(img, (int(w * scale), int(h * scale)))
 
-        # -----------------------------
-        # 3. Invert without extra copy
-        # -----------------------------
+        # -------------------------
+        # Invert (in-place safe)
+        # -------------------------
         if invert.lower() == "true":
             cv2.bitwise_not(img, img)
 
-        # -----------------------------
-        # 4. Processing pipeline
-        # -----------------------------
+        # -------------------------
+        # Processing
+        # -------------------------
         paths = process_algorithms(img, mode, spacing, density, start_time)
 
-        img = None  # release early
+        del img  # CRITICAL: free raw image immediately
 
         paths = simplify_paths(paths, simplify)
         paths = optimize_paths_tsp(paths, start_time)
 
-        # -----------------------------
-        # 5. Output generation
-        # -----------------------------
-        img_h, img_w = 0, 0  # already freed image, avoid reuse
+        # -------------------------
+        # Output
+        # -------------------------
         gcode, svg = generate_outputs(
             paths,
             0, 0,
@@ -107,25 +101,31 @@ async def generate(
             invert
         )
 
-        # -----------------------------
-        # 6. Force cleanup (important on Railway)
-        # -----------------------------
-        paths = None
-        gc.collect()
+        del paths  # CRITICAL
 
         return JSONResponse({"gcode": gcode, "svg": svg})
 
     except TimeoutException as e:
-        gc.collect()
         return JSONResponse({"gcode": "", "svg": format_error_svg(str(e))})
 
     except Exception as e:
-        gc.collect()
         return JSONResponse({"gcode": "", "svg": format_error_svg(str(e))})
 
+    finally:
+        # -------------------------
+        # HARD MEMORY CLEANUP (this is the real fix)
+        # -------------------------
+        try:
+            if img is not None:
+                del img
+        except:
+            pass
 
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
+        try:
+            if paths is not None:
+                del paths
+        except:
+            pass
 
-    uvicorn.run("main:app", host="0.0.0.0", port=port)
+        gc.collect()
+        cv2.destroyAllWindows()
