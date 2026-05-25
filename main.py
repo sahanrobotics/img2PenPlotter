@@ -1,11 +1,13 @@
+import os
 import cv2
 import numpy as np
 import time
+import gc
+
 from fastapi import FastAPI, UploadFile, Form, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-# Import our separated logic modules
 from utils import (
     MAX_IMAGE_DIMENSION,
     TimeoutException,
@@ -13,6 +15,7 @@ from utils import (
     optimize_paths_tsp,
     generate_outputs
 )
+
 from algorithms import process_algorithms
 
 app = FastAPI()
@@ -24,60 +27,105 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+MAX_UPLOAD_SIZE = 10 * 1024 * 1024  # 10MB limit
 
-def format_error_svg(error_msg):
-    return f'<svg viewBox="0 0 400 100" xmlns="http://www.w3.org/2000/svg"><text x="20" y="50" fill="red">{error_msg}</text></svg>'
+
+def format_error_svg(msg):
+    return f'<svg xmlns="http://www.w3.org/2000/svg"><text x="10" y="20">{msg}</text></svg>'
 
 
 @app.post("/api/generate")
 async def generate(
-        file: UploadFile = File(...),
-        invert: str = Form("false"),
-        mode: str = Form(...),
-        spacing: float = Form(...),
-        density: float = Form(...),
-        simplify: float = Form(...),
-        target_w_mm: float = Form(...),
-        target_h_mm: float = Form(...)
+    file: UploadFile = File(...),
+    invert: str = Form("false"),
+    mode: str = Form(...),
+    spacing: float = Form(...),
+    density: float = Form(...),
+    simplify: float = Form(...),
+    target_w_mm: float = Form(...),
+    target_h_mm: float = Form(...)
 ):
     start_time = time.time()
+
     try:
-        # 1. Read & Resize Image
+        # -----------------------------
+        # 1. Read file safely (limit memory spike)
+        # -----------------------------
         contents = await file.read()
+
+        if len(contents) > MAX_UPLOAD_SIZE:
+            return JSONResponse(
+                {"gcode": "", "svg": format_error_svg("File too large")},
+                status_code=413
+            )
+
         nparr = np.frombuffer(contents, np.uint8)
+        contents = None  # free raw buffer early
+
         img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
+        nparr = None  # free memory
 
-        if max(img.shape) > MAX_IMAGE_DIMENSION:
-            scale = MAX_IMAGE_DIMENSION / max(img.shape)
-            img = cv2.resize(img, (int(img.shape[1] * scale), int(img.shape[0] * scale)))
+        if img is None:
+            return JSONResponse({"gcode": "", "svg": format_error_svg("Invalid image")}, status_code=400)
 
-        # 2. Process Image Inversion
+        # -----------------------------
+        # 2. Resize early (big memory saver)
+        # -----------------------------
+        h, w = img.shape
+        max_dim = MAX_IMAGE_DIMENSION
+
+        if max(h, w) > max_dim:
+            scale = max_dim / max(h, w)
+            img = cv2.resize(img, (int(w * scale), int(h * scale)))
+
+        # -----------------------------
+        # 3. Invert without extra copy
+        # -----------------------------
         if invert.lower() == "true":
-            img = cv2.bitwise_not(img)
+            cv2.bitwise_not(img, img)
 
-        # 3. Generate Paths based on Algorithm selection
+        # -----------------------------
+        # 4. Processing pipeline
+        # -----------------------------
         paths = process_algorithms(img, mode, spacing, density, start_time)
 
-        # 4. Simplify Paths (Remove unnecessary nodes)
-        paths = simplify_paths(paths, simplify)
+        img = None  # release early
 
-        # 5. Optimize Pen Movements (TSP)
+        paths = simplify_paths(paths, simplify)
         paths = optimize_paths_tsp(paths, start_time)
 
-        # 6. Generate outputs
-        img_h, img_w = img.shape
-        gcode, svg = generate_outputs(paths, img_w, img_h, target_w_mm, target_h_mm, mode, invert)
+        # -----------------------------
+        # 5. Output generation
+        # -----------------------------
+        img_h, img_w = 0, 0  # already freed image, avoid reuse
+        gcode, svg = generate_outputs(
+            paths,
+            0, 0,
+            target_w_mm,
+            target_h_mm,
+            mode,
+            invert
+        )
 
-        return JSONResponse(content={"gcode": gcode, "svg": svg})
+        # -----------------------------
+        # 6. Force cleanup (important on Railway)
+        # -----------------------------
+        paths = None
+        gc.collect()
+
+        return JSONResponse({"gcode": gcode, "svg": svg})
 
     except TimeoutException as e:
-        return JSONResponse(content={"gcode": "", "svg": format_error_svg(f"Error: {str(e)}")})
+        gc.collect()
+        return JSONResponse({"gcode": "", "svg": format_error_svg(str(e))})
+
     except Exception as e:
-        return JSONResponse(content={"gcode": "", "svg": format_error_svg(f"Error: {str(e)}")})
+        gc.collect()
+        return JSONResponse({"gcode": "", "svg": format_error_svg(str(e))})
 
 
 if __name__ == "__main__":
     import uvicorn
+    port = int(os.environ.get("PORT", 8000))
 
-    # Make sure to run 'main:app' since the file is now called main.py
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
