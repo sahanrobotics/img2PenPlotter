@@ -2,7 +2,6 @@ import os
 import cv2
 import numpy as np
 import time
-import gc
 
 from fastapi import FastAPI, UploadFile, Form, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,6 +19,7 @@ from algorithms import process_algorithms
 
 app = FastAPI()
 
+# CORS (safe for frontend apps)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -28,104 +28,102 @@ app.add_middleware(
 )
 
 
-def format_error_svg(msg):
-    return f'<svg xmlns="http://www.w3.org/2000/svg"><text x="10" y="20">{msg}</text></svg>'
+def format_error_svg(error_msg: str):
+    return f"""
+    <svg viewBox="0 0 400 100" xmlns="http://www.w3.org/2000/svg">
+        <text x="20" y="50" fill="red">{error_msg}</text>
+    </svg>
+    """
 
 
 @app.post("/api/generate")
 async def generate(
-    file: UploadFile = File(...),
-    invert: str = Form("false"),
-    mode: str = Form(...),
-    spacing: float = Form(...),
-    density: float = Form(...),
-    simplify: float = Form(...),
-    target_w_mm: float = Form(...),
-    target_h_mm: float = Form(...)
+        file: UploadFile = File(...),
+        invert: str = Form("false"),
+        mode: str = Form(...),
+        spacing: float = Form(...),
+        density: float = Form(...),
+        simplify: float = Form(...),
+        target_w_mm: float = Form(...),
+        target_h_mm: float = Form(...)
 ):
-
     start_time = time.time()
 
-    img = None
-    nparr = None
-    contents = None
-    paths = None
-
     try:
-        # -------------------------
-        # Load image
-        # -------------------------
+        # 1. Read image
         contents = await file.read()
         nparr = np.frombuffer(contents, np.uint8)
-        contents = None
 
         img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
-        del nparr
 
         if img is None:
-            return JSONResponse({"gcode": "", "svg": format_error_svg("Invalid image")}, status_code=400)
+            return JSONResponse(
+                content={"gcode": "", "svg": format_error_svg("Invalid image")},
+                status_code=400
+            )
 
-        # -------------------------
-        # Resize (no quality loss in grayscale processing)
-        # -------------------------
-        h, w = img.shape
-        if max(h, w) > MAX_IMAGE_DIMENSION:
-            scale = MAX_IMAGE_DIMENSION / max(h, w)
-            img = cv2.resize(img, (int(w * scale), int(h * scale)))
+        # 2. Resize if too large
+        if max(img.shape) > MAX_IMAGE_DIMENSION:
+            scale = MAX_IMAGE_DIMENSION / max(img.shape)
+            img = cv2.resize(
+                img,
+                (int(img.shape[1] * scale), int(img.shape[0] * scale))
+            )
 
-        # -------------------------
-        # Invert (in-place safe)
-        # -------------------------
+        # 3. Invert if needed
         if invert.lower() == "true":
-            cv2.bitwise_not(img, img)
+            img = cv2.bitwise_not(img)
 
-        # -------------------------
-        # Processing
-        # -------------------------
+        # 4. Generate paths
         paths = process_algorithms(img, mode, spacing, density, start_time)
 
-        del img  # CRITICAL: free raw image immediately
-
+        # 5. Simplify
         paths = simplify_paths(paths, simplify)
+
+        # 6. Optimize (TSP)
         paths = optimize_paths_tsp(paths, start_time)
 
-        # -------------------------
-        # Output
-        # -------------------------
+        # 7. Output generation
+        img_h, img_w = img.shape
+
         gcode, svg = generate_outputs(
             paths,
-            0, 0,
+            img_w,
+            img_h,
             target_w_mm,
             target_h_mm,
             mode,
             invert
         )
 
-        del paths  # CRITICAL
-
-        return JSONResponse({"gcode": gcode, "svg": svg})
+        return JSONResponse(content={
+            "gcode": gcode,
+            "svg": svg
+        })
 
     except TimeoutException as e:
-        return JSONResponse({"gcode": "", "svg": format_error_svg(str(e))})
+        return JSONResponse(content={
+            "gcode": "",
+            "svg": format_error_svg(f"Timeout: {str(e)}")
+        })
 
     except Exception as e:
-        return JSONResponse({"gcode": "", "svg": format_error_svg(str(e))})
+        return JSONResponse(content={
+            "gcode": "",
+            "svg": format_error_svg(f"Error: {str(e)}")
+        })
 
-    finally:
-        # -------------------------
-        # HARD MEMORY CLEANUP (this is the real fix)
-        # -------------------------
-        try:
-            if img is not None:
-                del img
-        except:
-            pass
 
-        try:
-            if paths is not None:
-                del paths
-        except:
-            pass
+# -----------------------------
+# Railway / Production Entry
+# -----------------------------
+if __name__ == "__main__":
+    import uvicorn
 
-        gc.collect()
-        cv2.destroyAllWindows()
+    port = int(os.environ.get("PORT", 8000))
+
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=port
+    )
