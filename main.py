@@ -5,7 +5,7 @@ import time
 
 from fastapi import FastAPI, UploadFile, Form, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse  # Added FileResponse
 
 from utils import (
     MAX_IMAGE_DIMENSION,
@@ -34,6 +34,20 @@ def format_error_svg(error_msg: str):
         <text x="20" y="50" fill="red">{error_msg}</text>
     </svg>
     """
+
+# -------------------------------------------------------------------------
+# NEW ENDPOINT: Hosts the last generated G-code file
+# -------------------------------------------------------------------------
+@app.get("/api/latest-gcode")
+async def get_latest_gcode():
+    file_path = "last_generated.gcode"
+    if os.path.exists(file_path):
+        # This will trigger a file download with the name "latest_plot.gcode"
+        return FileResponse(file_path, media_type="text/plain", filename="latest_plot.gcode")
+    return JSONResponse(
+        content={"error": "No G-code file found. Please generate one first."}, 
+        status_code=404
+    )
 
 
 @app.post("/api/generate")
@@ -95,6 +109,12 @@ async def generate(
             mode,
             invert
         )
+
+        # -----------------------------------------------------------------
+        # NEW: Save the generated G-code so it can be hosted/downloaded
+        # -----------------------------------------------------------------
+        with open("last_generated.gcode", "w", encoding="utf-8") as f:
+            f.write(gcode)
 
         return JSONResponse(content={
             "gcode": gcode,
