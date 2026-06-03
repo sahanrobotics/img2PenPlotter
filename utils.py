@@ -50,7 +50,6 @@ def optimize_paths_tsp(paths, start_time):
     for _ in range(1, N):
         if _ % 2000 == 0: check_time(start_time)
 
-        # Tiny search window ensures calculation takes practically zero CPU power
         active_idx = np.nonzero(active)[0][:TSP_SEARCH_WINDOW]
 
         w_starts = starts[active_idx]
