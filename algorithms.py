@@ -77,36 +77,32 @@ def _edge_contour(img_gray, h, w, spacing, density, start_t):
     """
     Improvements
     ─────────────
-    • Detail Boost: Laplacian sharpening added before Canny to pick up fine textures.
-    • Anti-Overlap: Implemented Morphological Thinning. This forces every edge to 
-      be exactly 1-pixel wide, preventing the 'double-tracing' effect.
-    • Chaikin Curve Smoothing: Maintains high-quality organic line feel.
+    • Reduced Detail: Using a stronger 5x5 blur and higher Canny thresholds to 
+      ignore noise and micro-textures, focusing only on main forms.
+    • Cleanliness: Morphological Opening deletes small 'specks' before tracing.
+    • Anti-Overlap: Thinning (Skeletonization) ensures single-pixel lines only.
+    • Chaikin Curve Smoothing: Keeps the final strokes fluid and organic.
     """
-    # 1. Contrast & Detail Enhancement
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-    enhanced = clahe.apply(img_gray)
+    # 1. Stronger Blur to suppress high-frequency detail/noise
+    blur = cv2.GaussianBlur(img_gray, (5, 5), 0)
     
-    # Laplacian sharpening pulls out micro-details (hair, iris, textures)
-    laplacian = cv2.Laplacian(enhanced, cv2.CV_16S, ksize=3)
-    sharpened = cv2.convertScaleAbs(enhanced - 0.5 * laplacian)
-
-    # 2. Smooth background noise but keep detail edges
-    blur = cv2.GaussianBlur(sharpened, (3, 3), 0)
-
-    # 3. Sensitive Canny for high detail
+    # 2. Conservative Canny thresholds (ignoring weak edges)
     med = float(np.median(blur))
-    lo  = max(5,  int(0.50 * med))
-    hi  = min(255, int(1.10 * med))
+    lo  = max(40,  int(0.75 * med)) # Higher floor to kill low-contrast noise
+    hi  = min(255, int(1.50 * med))
     edges = cv2.Canny(blur, lo, hi)
 
+    # 3. Clean up specks (Morphological Opening)
+    kernel_small = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    edges = cv2.morphologyEx(edges, cv2.MORPH_OPEN, kernel_small)
+
     # 4. Anti-Overlap: Thinning (Skeletonization) 
-    # This prevents lines from being traced twice (once on each side of the edge)
+    # Ensures a single stroke instead of double-tracing an edge.
     temp_edges = edges.copy()
     skeleton = np.zeros(edges.shape, np.uint8)
     element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
     
-    # Fast thinning loop (4-5 iterations usually cleans the whole image)
-    for _ in range(5):
+    for _ in range(4): # 4 passes is usually enough for single-px skeleton
         eroded = cv2.erode(temp_edges, element)
         temp = cv2.dilate(eroded, element)
         temp = cv2.subtract(temp_edges, temp)
@@ -114,10 +110,11 @@ def _edge_contour(img_gray, h, w, spacing, density, start_t):
         temp_edges = eroded.copy()
         if cv2.countNonZero(temp_edges) == 0: break
 
-    # 5. Find Contours (RETR_EXTERNAL prevents nested overlapping loops)
+    # 5. Find Contours
     cnts, _ = cv2.findContours(skeleton, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    min_len = max(12, (h + w) // 180) 
+    # Filter out short segments (increased threshold for 'cleaner' look)
+    min_len = max(20, (h + w) // 100) 
     paths = []
 
     for c in cnts:
@@ -125,8 +122,8 @@ def _edge_contour(img_gray, h, w, spacing, density, start_t):
         if perimeter < min_len:
             continue
             
-        # Simplify geometry slightly to prep for curving
-        epsilon = min(1.8, max(0.6, perimeter * 0.004))
+        # Simplify geometry
+        epsilon = min(2.0, max(0.8, perimeter * 0.005))
         approx = cv2.approxPolyDP(c, epsilon, False)
         
         if len(approx) < 3:
@@ -140,8 +137,7 @@ def _edge_contour(img_gray, h, w, spacing, density, start_t):
         # 6. Chaikin Curve Smoothing
         for _ in range(2): 
             p0, p1 = pts[:-1], pts[1:]
-            q = 0.75 * p0 + 0.25 * p1
-            r = 0.25 * p0 + 0.75 * p1
+            q, r = 0.75 * p0 + 0.25 * p1, 0.25 * p0 + 0.75 * p1
             new_pts = np.empty((len(p0) * 2, 2), dtype=np.float32)
             new_pts[0::2], new_pts[1::2] = q, r
             pts = np.vstack((pts[0], new_pts, pts[-1]))
