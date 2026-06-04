@@ -75,42 +75,41 @@ def process_algorithms(
 
 def _edge_contour(img_gray, h, w, spacing, density, start_t):
     """
-    Generates Artistic Edge Art for Pen Plotters.
-    - Captures moderate details (hair, features, wrinkles) without chaotic noise.
-    - Produces incredibly smooth, flowing curves.
-    - Auto-adjusts brightness natively.
+    Generates clean, moderate, artistic contours for a Pen Plotter.
+    - Normalizes brightness automatically.
+    - Uses Median Blur to eliminate messy textures while keeping sharp boundaries.
+    - No artificial line slicing (allows natural contour tracing).
+    - Smooths lines organically using Chaikin's corner cutting.
     """
     
     # 1. Global Brightness Normalization
-    img = cv2.normalize(img_gray, None, 0, 255, cv2.NORM_MINMAX)
+    # Fixes dark or blown-out images before processing
+    img_gray = cv2.normalize(img_gray, None, 0, 255, cv2.NORM_MINMAX)
 
-    # 2. Gentle Detail Awakening
-    # A mild CLAHE (clipLimit=1.5) brings back facial features and textures 
-    # that would otherwise vanish, without blowing out the shadows into noise.
-    clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
-    img = clahe.apply(img)
+    # 2. Detail Management (The secret to "Moderate Lines")
+    # Median blur wipes out high-frequency noise/messy details but DOES NOT 
+    # blur the actual structural edges. This gives it a clean, vectorized art look.
+    blurred = cv2.medianBlur(img_gray, 5)
 
-    # 3. Artistic Noise Reduction
-    # Bilateral filter is perfect here. It smooths out messy grain but 
-    # strictly preserves real structural details (like the outline of an eye).
-    blurred = cv2.bilateralFilter(img, d=5, sigmaColor=50, sigmaSpace=50)
-
-    # 4. Adaptive Canny Thresholding
-    med = float(np.median(blurred))
-    lower = int(max(20, 0.70 * med))
-    upper = int(min(255, 1.30 * med))
+    # 3. Adaptive Canny Thresholding 
+    # (Removed CLAHE here so we don't pick up exaggerated shadow noise)
+    v = np.median(blurred)
+    sigma = 0.33
+    lower = int(max(30, (1.0 - sigma) * v))
+    upper = int(min(255, (1.0 + sigma) * v))
     edges = cv2.Canny(blurred, lower, upper)
 
-    # 5. Organic Morphological Connection
-    # Using an ELLIPSE kernel instead of RECT creates rounder, smoother 
-    # connections when bridging tiny gaps in the edges.
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    # 4. Mild line connection
+    # Bridging tiny 1-pixel gaps using a very small 2x2 kernel so lines 
+    # don't become messy, blobby, or merge incorrectly.
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
     edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
 
+    # 5. Extract Contours
     cnts, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
-    # Lowered slightly to preserve small, meaningful artistic details
-    min_len = max(15, (h + w) // 120)
+    # Drop small useless marks (dust/specks). Scales naturally with image size.
+    min_len = max(20, (h + w) // 100)
     paths = []
 
     for c in cnts:
@@ -118,11 +117,11 @@ def _edge_contour(img_gray, h, w, spacing, density, start_t):
         if perimeter < min_len:
             continue
             
-        # 6. Tighter Simplification (Less Jaggedness)
-        # Using a smaller epsilon means the polygon hugs the natural curve better.
-        epsilon = min(1.5, max(0.5, perimeter * 0.001))
-        approx = cv2.approxPolyDP(c, epsilon, True)
+        # 6. Simplify the polygon to remove pixel "stair-stepping"
+        epsilon = min(2.5, max(1.0, perimeter * 0.002))
+        approx = cv2.approxPolyDP(c, epsilon, False)
         
+        # Need at least 3 points to apply curve smoothing
         if len(approx) < 3:
             if len(approx) == 2:
                 paths.append([(float(approx[0][0][0]), float(approx[0][0][1])),
@@ -131,30 +130,28 @@ def _edge_contour(img_gray, h, w, spacing, density, start_t):
 
         pts = approx.reshape(-1, 2).astype(np.float32)
 
-        # 7. Ultra-Smooth Chaikin's Corner Cutting
-        # Increased to 3 iterations. This slices the corners 3 times, resulting 
-        # in paths that are mathematically buttery smooth, reducing plotter vibration.
-        for _ in range(3): 
+        # 7. Vectorized Chaikin's Corner Cutting
+        # Slices the sharp corners off the simplified polygon. 
+        # 2 iterations turns jagged lines into beautiful, flowing, Bezier-like curves.
+        for _ in range(2): 
             p0 = pts[:-1]
             p1 = pts[1:]
             
-            # Interpolate at 25% and 75%
+            # Interpolate new points at 25% and 75%
             q = 0.75 * p0 + 0.25 * p1
             r = 0.25 * p0 + 0.75 * p1
             
-            # Interleave efficiently
+            # Interleave arrays
             new_pts = np.empty((len(p0) * 2, 2), dtype=np.float32)
             new_pts[0::2] = q
             new_pts[1::2] = r
             
-            # Reattach endpoints to preserve the full bounds of the stroke
+            # Reattach endpoints to preserve line length
             pts = np.vstack((pts[0], new_pts, pts[-1]))
             
         paths.append([(float(x), float(y)) for x, y in pts])
 
     return paths
-
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2.  Hatching
