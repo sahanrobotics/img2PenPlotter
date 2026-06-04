@@ -80,24 +80,59 @@ def optimize_paths_tsp(paths, start_time):
 
 
 def generate_outputs(paths, img_w, img_h, target_w_mm, target_h_mm, mode, invert):
-    """Converts the processed paths into G-code and an SVG preview."""
-    scale_x, scale_y = target_w_mm / img_w, target_h_mm / img_h
+    """Converts the processed paths into G-code and an SVG preview.
+    Ensures A4 bounding box constraints and removes ALL negative coordinates."""
+    
+    # 1. Define Standard A4 bounds with a 5mm safety margin (200 x 287 mm printable area)
+    is_landscape = img_w > img_h
+    a4_w = 287.0 if is_landscape else 200.0
+    a4_h = 200.0 if is_landscape else 287.0
+    
+    # Use requested targets, but NEVER exceed A4 paper dimensions
+    fit_w = min(target_w_mm, a4_w)
+    fit_h = min(target_h_mm, a4_h)
+
+    # 2. Compute a uniform scaling factor to preserve aspect ratio (prevents stretching)
+    scale = min(fit_w / img_w, fit_h / img_h)
+    
+    # Calculate actual physical dimensions
+    actual_w = img_w * scale
+    actual_h = img_h * scale
+    
+    # 3. Calculate offset to perfectly center the plot on the page
+    offset_x = (fit_w - actual_w) / 2.0
+    offset_y = (fit_h - actual_h) / 2.0
+
     gcode = [f"; Mode: {mode}", f"; Inverted: {invert}", "G21", "G90", "G0 Z5"]
     svg_p = []
+
+    def format_coord(px, py):
+        """Scales, centers, and rigidly clamps coordinates to forbid negatives."""
+        # Scale and add centering offset
+        gx = (px * scale) + offset_x
+        
+        # G-Code origin (0,0) is bottom-left, SVG origin is top-left. So we invert Y.
+        gy = fit_h - ((py * scale) + offset_y)
+        
+        # STRICT CLAMPING: Forces value to be exactly between 0.0 and the max paper dimension.
+        gx = max(0.0, min(gx, fit_w))
+        gy = max(0.0, min(gy, fit_h))
+        
+        return f"X{gx:.2f} Y{gy:.2f}"
 
     for path in paths:
         if len(path) < 2: continue
 
-        # G-Code
-        gcode.append(f"G0 X{path[0][0] * scale_x:.2f} Y{target_h_mm - (path[0][1] * scale_y):.2f}")
+        # --- G-Code Generation ---
+        gcode.append(f"G0 {format_coord(path[0][0], path[0][1])}")
         gcode.append("G1 Z0 F3000")
 
-        # SVG
-        svg_d = f"M {path[0][0]},{path[0][1]} "
+        # --- SVG Generation ---
+        svg_d = f"M {path[0][0]:.2f},{path[0][1]:.2f} "
 
-        for x, y in path[1:]:
-            gcode.append(f"G1 X{x * scale_x:.2f} Y{target_h_mm - (y * scale_y):.2f}")
-            svg_d += f"L {x},{y} "
+        for px, py in path[1:]:
+            gcode.append(f"G1 {format_coord(px, py)}")
+            svg_d += f"L {px:.2f},{py:.2f} "
 
         gcode.append("G0 Z5")
         svg_p.append(f'<path d="{svg_d}" fill="none" stroke="black" stroke-width="1.5"/>')
