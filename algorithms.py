@@ -77,31 +77,42 @@ def _edge_contour(img_gray, h, w, spacing, density, start_t):
     """
     Improvements
     ─────────────
-    • Bilateral filter preserves edges better than raw input → cleaner contours.
-    • Adaptive Canny thresholds from median brightness (Otsu-style).
-    • approxPolyDP smoothing removes jagged staircasing.
-    • Min-length guard raised proportionally to image size.
+    • CLAHE (Adaptive Histogram Equalization) pulls beautiful edge details out of deep shadows and bright highlights.
+    • Bilateral filter tuned to preserve fine textures (like hair/fabric) while still killing sensor noise.
+    • Morphological Closing bridges 1-px gaps, yielding much longer, continuous, flowing strokes instead of fragmented dots.
+    • Dynamic Douglas-Peucker smoothing: epsilon scales with contour length for organic, natural-looking curves.
     """
-    # Preserve edges while smoothing noise
-    smooth = cv2.bilateralFilter(img_gray, d=7, sigmaColor=50, sigmaSpace=50)
+    # 1. Local contrast enhancement (reveals hidden edges in dark/bright zones)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(img_gray)
 
-    # Adaptive Canny: thresholds scale with image brightness
+    # 2. Preserve main edges while smoothing out background noise
+    smooth = cv2.bilateralFilter(enhanced, d=5, sigmaColor=35, sigmaSpace=35)
+
+    # 3. Adaptive Canny: thresholds scale with image brightness
     med = float(np.median(smooth))
     lo  = max(10,  int(0.66 * med))
     hi  = min(255, int(1.33 * med))
     edges = cv2.Canny(smooth, lo, hi)
 
+    # 4. Connect fragmented line segments (makes lines longer and more fluid)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
+
     cnts, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
-    min_len = max(8, (h + w) // 200)        # scale guard to image size
-    epsilon  = 1.2                           # Douglas-Peucker smoothing
-
+    min_len = max(10, (h + w) // 150)        # Scale guard to image size
     paths = []
+
     for c in cnts:
-        if cv2.arcLength(c, False) < min_len:
+        perimeter = cv2.arcLength(c, False)
+        if perimeter < min_len:
             continue
-        # Smooth the contour (reduces staircase artifacts on curves)
+            
+        # 5. Dynamic smoothing: slightly more smoothing for long sweeping curves, less for sharp tiny details
+        epsilon = min(1.5, max(0.5, perimeter * 0.005))
         approx = cv2.approxPolyDP(c, epsilon, False)
+        
         if len(approx) >= 2:
             paths.append([(float(p[0][0]), float(p[0][1])) for p in approx])
 
