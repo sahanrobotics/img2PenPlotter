@@ -73,70 +73,58 @@ def process_algorithms(
 # 1.  Edge Contour
 # ─────────────────────────────────────────────────────────────────────────────
 
+import cv2
+import numpy as np
+
 def _edge_contour(img_gray, h, w, spacing, density, start_t):
     """
-    Optimized for Pen Plotters: Rapidly drawable, artistic contours.
-    - Adjusts global brightness before processing.
-    - Drops fine/messy texture while preserving structural details.
-    - Prevents double-lining (tracing both sides of an edge).
-    - Uses Chaikin's algorithm for organic, buttery-smooth curves.
+    Generates clean, moderate, artistic contours for a Pen Plotter.
+    - Normalizes brightness automatically.
+    - Uses Median Blur to eliminate messy textures while keeping sharp boundaries.
+    - No artificial line slicing (allows natural contour tracing).
+    - Smooths lines organically using Chaikin's corner cutting.
     """
     
-    # 1. Global Brightness & Contrast Normalization
-    # Stretches the histogram to full 0-255. Fixes over/under exposed images automatically.
+    # 1. Global Brightness Normalization
+    # Fixes dark or blown-out images before processing
     img_gray = cv2.normalize(img_gray, None, 0, 255, cv2.NORM_MINMAX)
 
-    # 2. Detail Management (Artistic Filter)
-    # Bilateral filter flattens high-frequency textures (noise, pores, fabric) 
-    # but strictly preserves sharp structural outlines. 
-    # (d=5 is fast enough for real-time but powerful enough to clean the image).
-    flattened = cv2.bilateralFilter(img_gray, d=5, sigmaColor=75, sigmaSpace=75)
+    # 2. Detail Management (The secret to "Moderate Lines")
+    # Median blur wipes out high-frequency noise/messy details but DOES NOT 
+    # blur the actual structural edges. This gives it a clean, vectorized art look.
+    blurred = cv2.medianBlur(img_gray, 5)
 
-    # 3. Local Edge Pop (CLAHE)
-    # Exposes edges hiding in deep shadows or blown-out highlights
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(flattened)
+    # 3. Adaptive Canny Thresholding 
+    # (Removed CLAHE here so we don't pick up exaggerated shadow noise)
+    v = np.median(blurred)
+    sigma = 0.33
+    lower = int(max(30, (1.0 - sigma) * v))
+    upper = int(min(255, (1.0 + sigma) * v))
+    edges = cv2.Canny(blurred, lower, upper)
 
-    # 4. Blur to merge fragments into solid drawable strokes
-    blur = cv2.GaussianBlur(enhanced, (5, 5), 0)
-
-    # 5. Adaptive Canny Thresholding (Tuned for Plotters)
-    med = float(np.median(blur))
-    # Increased lower bound (0.80 instead of 0.66) to drop faint background noise
-    lo  = max(25,  int(0.80 * med)) 
-    hi  = min(255, int(1.33 * med))
-    edges = cv2.Canny(blur, lo, hi)
-
-    # 6. Connect fragmented lines
-    # Bridges tiny diagonal gaps so the plotter does one long stroke instead of 3 short ones
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    # 4. Mild line connection
+    # Bridging tiny 1-pixel gaps using a very small 2x2 kernel so lines 
+    # don't become messy, blobby, or merge incorrectly.
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
     edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
 
-    # RETR_EXTERNAL or RETR_LIST: LIST gets inner details (eyes, nose), which we want.
+    # 5. Extract Contours
     cnts, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
-    # Plotters hate tiny lines (Pen up/down takes forever). 
-    # Scale min_len by image size. Drop anything smaller.
-    min_len = max(20, (h + w) // 100) 
+    # Drop small useless marks (dust/specks). Scales naturally with image size.
+    min_len = max(20, (h + w) // 100)
     paths = []
 
     for c in cnts:
-        perimeter = cv2.arcLength(c, False)
+        perimeter = cv2.arcLength(c, True)
         if perimeter < min_len:
             continue
             
-        # 7. Polygon Simplification
-        # Epsilon scaled to smooth out pixel "stair-stepping"
-        epsilon = min(3.0, max(1.0, perimeter * 0.003))
+        # 6. Simplify the polygon to remove pixel "stair-stepping"
+        epsilon = min(2.5, max(1.0, perimeter * 0.002))
         approx = cv2.approxPolyDP(c, epsilon, False)
         
-        # 8. Single-Stroke Enforcement (Plotter Lifesaver)
-        # findContours traces the *perimeter* of a 1-pixel Canny line, creating a closed loop.
-        # If it's a collapsed loop, slice the array in half to trace it exactly once.
-        if cv2.contourArea(c) < perimeter * 1.5:
-            approx = approx[:max(2, len(approx) // 2 + 1)]
-        
-        # Need at least 3 points to curve smooth
+        # Need at least 3 points to apply curve smoothing
         if len(approx) < 3:
             if len(approx) == 2:
                 paths.append([(float(approx[0][0][0]), float(approx[0][0][1])),
@@ -145,29 +133,28 @@ def _edge_contour(img_gray, h, w, spacing, density, start_t):
 
         pts = approx.reshape(-1, 2).astype(np.float32)
 
-        # 9. Vectorized Chaikin's Corner Cutting
-        # Translates sharp, jagged polygon segments into natural, flowing Bezier-like curves.
+        # 7. Vectorized Chaikin's Corner Cutting
+        # Slices the sharp corners off the simplified polygon. 
+        # 2 iterations turns jagged lines into beautiful, flowing, Bezier-like curves.
         for _ in range(2): 
             p0 = pts[:-1]
             p1 = pts[1:]
             
-            # Interpolate at 25% and 75%
+            # Interpolate new points at 25% and 75%
             q = 0.75 * p0 + 0.25 * p1
             r = 0.25 * p0 + 0.75 * p1
             
-            # Interleave
+            # Interleave arrays
             new_pts = np.empty((len(p0) * 2, 2), dtype=np.float32)
             new_pts[0::2] = q
             new_pts[1::2] = r
             
-            # Reattach endpoints
+            # Reattach endpoints to preserve line length
             pts = np.vstack((pts[0], new_pts, pts[-1]))
             
-        # Append to paths list as standard python floats (easily consumable by SVG/GCODE generators)
         paths.append([(float(x), float(y)) for x, y in pts])
 
     return paths
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2.  Hatching
