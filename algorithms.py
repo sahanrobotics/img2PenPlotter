@@ -73,55 +73,68 @@ def process_algorithms(
 # 1.  Edge Contour
 # ─────────────────────────────────────────────────────────────────────────────
 
+import cv2
+import numpy as np
+
 def _edge_contour(img_gray, h, w, spacing, density, start_t):
     """
-    Generates clean, moderate, artistic contours for a Pen Plotter.
-    - Normalizes brightness automatically.
-    - Uses Median Blur to eliminate messy textures while keeping sharp boundaries.
-    - No artificial line slicing (allows natural contour tracing).
-    - Smooths lines organically using Chaikin's corner cutting.
+    Advanced Dynamic Edge Art for Pen Plotters.
+    - Detail Level: Controlled dynamically via 'density' (0.0 to 1.0).
+    - Smoothness: Controlled dynamically via 'spacing' and Chaikin's iterations.
+    - Physics-Aware: Prevents plotter 'stutter' by removing micro-paths.
     """
     
-    # 1. Global Brightness Normalization
-    # Fixes dark or blown-out images before processing
-    img_gray = cv2.normalize(img_gray, None, 0, 255, cv2.NORM_MINMAX)
+    # --- 1. DYNAMIC BRIGHTNESS & CONTRAST ---
+    # Normalize global range
+    img = cv2.normalize(img_gray, None, 0, 255, cv2.NORM_MINMAX)
+    
+    # Use 'density' to set the CLAHE clip limit (0.5 to 3.0)
+    # Higher density = more features extracted from highlights/shadows
+    dynamic_clip = 0.5 + (density * 2.5) 
+    clahe = cv2.createCLAHE(clipLimit=dynamic_clip, tileGridSize=(8, 8))
+    img = clahe.apply(img)
 
-    # 2. Detail Management (The secret to "Moderate Lines")
-    # Median blur wipes out high-frequency noise/messy details but DOES NOT 
-    # blur the actual structural edges. This gives it a clean, vectorized art look.
-    blurred = cv2.medianBlur(img_gray, 5)
+    # --- 2. ADVANCED NOISE SUPPRESSION ---
+    # sigmaColor controls how much detail is merged. 
+    # We link it to density: Higher density = smaller sigma (preserves more detail)
+    sig_color = 100 - (density * 70) 
+    blurred = cv2.bilateralFilter(img, d=5, sigmaColor=sig_color, sigmaSpace=50)
 
-    # 3. Adaptive Canny Thresholding 
-    # (Removed CLAHE here so we don't pick up exaggerated shadow noise)
-    v = np.median(blurred)
-    sigma = 0.33
-    lower = int(max(30, (1.0 - sigma) * v))
-    upper = int(min(255, (1.0 + sigma) * v))
+    # --- 3. STATISTICAL DYNAMIC CANNY ---
+    med = np.median(blurred)
+    std = np.std(blurred)
+    
+    # High density narrows the gap, forcing more lines to appear.
+    # Low density widens the gap, allowing only the strongest edges.
+    lower = int(max(0, (1.0 - (0.3 + density * 0.2)) * med))
+    upper = int(min(255, (1.0 + (0.3 + density * 0.2)) * med))
     edges = cv2.Canny(blurred, lower, upper)
 
-    # 4. Mild line connection
-    # Bridging tiny 1-pixel gaps using a very small 2x2 kernel so lines 
-    # don't become messy, blobby, or merge incorrectly.
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    # --- 4. MORPHOLOGICAL REFINEMENT ---
+    # Close small gaps to ensure long, continuous pen paths
+    kernel_size = 3 if density < 0.5 else 2
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
     edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
 
-    # 5. Extract Contours
+    # --- 5. CONTOUR EXTRACTION & FILTERING ---
     cnts, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
-    # Drop small useless marks (dust/specks). Scales naturally with image size.
-    min_len = max(20, (h + w) // 100)
+    # Dynamic Path Rejection: 
+    # High density allows shorter strokes; low density keeps only major lines.
+    min_len = max(10, (h + w) // (80 + int(density * 100)))
+    
     paths = []
-
     for c in cnts:
         perimeter = cv2.arcLength(c, True)
         if perimeter < min_len:
             continue
             
-        # 6. Simplify the polygon to remove pixel "stair-stepping"
-        epsilon = min(2.5, max(1.0, perimeter * 0.002))
+        # Dynamic Simplification (Epsilon)
+        # Linked to spacing: larger spacing means the pen shouldn't wiggle as much
+        eps_factor = 0.001 + (spacing * 0.002)
+        epsilon = min(2.0, max(0.5, perimeter * eps_factor))
         approx = cv2.approxPolyDP(c, epsilon, False)
         
-        # Need at least 3 points to apply curve smoothing
         if len(approx) < 3:
             if len(approx) == 2:
                 paths.append([(float(approx[0][0][0]), float(approx[0][0][1])),
@@ -130,23 +143,17 @@ def _edge_contour(img_gray, h, w, spacing, density, start_t):
 
         pts = approx.reshape(-1, 2).astype(np.float32)
 
-        # 7. Vectorized Chaikin's Corner Cutting
-        # Slices the sharp corners off the simplified polygon. 
-        # 2 iterations turns jagged lines into beautiful, flowing, Bezier-like curves.
-        for _ in range(2): 
+        # --- 6. VECTORIZED CHAIKIN'S SMOOTHING ---
+        # 3 iterations for "Buttery Smooth" curves.
+        for _ in range(3): 
             p0 = pts[:-1]
             p1 = pts[1:]
-            
-            # Interpolate new points at 25% and 75%
             q = 0.75 * p0 + 0.25 * p1
             r = 0.25 * p0 + 0.75 * p1
             
-            # Interleave arrays
             new_pts = np.empty((len(p0) * 2, 2), dtype=np.float32)
             new_pts[0::2] = q
             new_pts[1::2] = r
-            
-            # Reattach endpoints to preserve line length
             pts = np.vstack((pts[0], new_pts, pts[-1]))
             
         paths.append([(float(x), float(y)) for x, y in pts])
