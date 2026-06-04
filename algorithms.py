@@ -72,257 +72,103 @@ def process_algorithms(
 # ─────────────────────────────────────────────────────────────────────────────
 # 1.  Edge Contour
 # ─────────────────────────────────────────────────────────────────────────────
-import cv2
-import numpy as np
-
-
-def stitch_paths(paths, max_gap=15):
-    """
-    Connect nearby paths to reduce pen-up moves.
-    """
-
-    if len(paths) < 2:
-        return paths
-
-    used = [False] * len(paths)
-    result = []
-
-    for start_idx in range(len(paths)):
-
-        if used[start_idx]:
-            continue
-
-        current = list(paths[start_idx])
-        used[start_idx] = True
-
-        while True:
-
-            end_pt = np.array(current[-1])
-
-            best_idx = -1
-            best_dist = max_gap
-            reverse = False
-
-            for i, p in enumerate(paths):
-
-                if used[i]:
-                    continue
-
-                d1 = np.linalg.norm(end_pt - np.array(p[0]))
-                d2 = np.linalg.norm(end_pt - np.array(p[-1]))
-
-                if d1 < best_dist:
-                    best_dist = d1
-                    best_idx = i
-                    reverse = False
-
-                if d2 < best_dist:
-                    best_dist = d2
-                    best_idx = i
-                    reverse = True
-
-            if best_idx == -1:
-                break
-
-            next_path = paths[best_idx]
-
-            if reverse:
-                next_path = next_path[::-1]
-
-            current.extend(next_path)
-            used[best_idx] = True
-
-        result.append(current)
-
-    return result
-
 
 def _edge_contour(img_gray, h, w, spacing, density, start_t):
+    """
+    Optimized for Pen Plotters: Rapidly drawable, artistic contours.
+    - Adjusts global brightness before processing.
+    - Drops fine/messy texture while preserving structural details.
+    - Prevents double-lining (tracing both sides of an edge).
+    - Uses Chaikin's algorithm for organic, buttery-smooth curves.
+    """
+    
+    # 1. Global Brightness & Contrast Normalization
+    # Stretches the histogram to full 0-255. Fixes over/under exposed images automatically.
+    img_gray = cv2.normalize(img_gray, None, 0, 255, cv2.NORM_MINMAX)
 
-    # -------------------------------------------------------
-    # SPEED OPTIMIZATION
-    # -------------------------------------------------------
+    # 2. Detail Management (Artistic Filter)
+    # Bilateral filter flattens high-frequency textures (noise, pores, fabric) 
+    # but strictly preserves sharp structural outlines. 
+    # (d=5 is fast enough for real-time but powerful enough to clean the image).
+    flattened = cv2.bilateralFilter(img_gray, d=5, sigmaColor=75, sigmaSpace=75)
 
-    scale = 0.65
+    # 3. Local Edge Pop (CLAHE)
+    # Exposes edges hiding in deep shadows or blown-out highlights
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(flattened)
 
-    small = cv2.resize(
-        img_gray,
-        None,
-        fx=scale,
-        fy=scale,
-        interpolation=cv2.INTER_AREA
-    )
+    # 4. Blur to merge fragments into solid drawable strokes
+    blur = cv2.GaussianBlur(enhanced, (5, 5), 0)
 
-    sh, sw = small.shape[:2]
+    # 5. Adaptive Canny Thresholding (Tuned for Plotters)
+    med = float(np.median(blur))
+    # Increased lower bound (0.80 instead of 0.66) to drop faint background noise
+    lo  = max(25,  int(0.80 * med)) 
+    hi  = min(255, int(1.33 * med))
+    edges = cv2.Canny(blur, lo, hi)
 
-    # -------------------------------------------------------
-    # CLAHE
-    # -------------------------------------------------------
+    # 6. Connect fragmented lines
+    # Bridges tiny diagonal gaps so the plotter does one long stroke instead of 3 short ones
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
 
-    clahe = cv2.createCLAHE(
-        clipLimit=2.0,
-        tileGridSize=(8, 8)
-    )
+    # RETR_EXTERNAL or RETR_LIST: LIST gets inner details (eyes, nose), which we want.
+    cnts, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
-    enhanced = clahe.apply(small)
-
-    # -------------------------------------------------------
-    # STRONGER BLUR = LESS DETAIL
-    # -------------------------------------------------------
-
-    blur = cv2.GaussianBlur(
-        enhanced,
-        (9, 9),
-        0
-    )
-
-    # -------------------------------------------------------
-    # ADAPTIVE CANNY
-    # -------------------------------------------------------
-
-    med = np.median(blur)
-
-    low = int(max(20, 0.7 * med))
-    high = int(min(255, 1.4 * med))
-
-    edges = cv2.Canny(
-        blur,
-        low,
-        high
-    )
-
-    # -------------------------------------------------------
-    # JOIN FRAGMENTS
-    # -------------------------------------------------------
-
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (5, 5)
-    )
-
-    edges = cv2.morphologyEx(
-        edges,
-        cv2.MORPH_CLOSE,
-        kernel,
-        iterations=2
-    )
-
-    # -------------------------------------------------------
-    # ONLY OUTER CONTOURS
-    # HUGE REDUCTION IN DETAIL
-    # -------------------------------------------------------
-
-    cnts, _ = cv2.findContours(
-        edges,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE
-    )
-
+    # Plotters hate tiny lines (Pen up/down takes forever). 
+    # Scale min_len by image size. Drop anything smaller.
+    min_len = max(20, (h + w) // 100) 
     paths = []
 
-    min_len = max(
-        40,
-        (sh + sw) // 50
-    )
-
     for c in cnts:
-
         perimeter = cv2.arcLength(c, False)
-
         if perimeter < min_len:
             continue
-
-        # ---------------------------------------------------
-        # AGGRESSIVE SIMPLIFICATION
-        # ---------------------------------------------------
-
-        epsilon = perimeter * 0.03
-
-        approx = cv2.approxPolyDP(
-            c,
-            epsilon,
-            False
-        )
-
-        # ---------------------------------------------------
-        # REMOVE DOUBLE-LINE CONTOURS
-        # ---------------------------------------------------
-
-        area = cv2.contourArea(c)
-
-        if area < perimeter * 2:
-
-            if len(approx) > 3:
-                approx = approx[:len(approx)//2 + 1]
-
-        if len(approx) < 2:
+            
+        # 7. Polygon Simplification
+        # Epsilon scaled to smooth out pixel "stair-stepping"
+        epsilon = min(3.0, max(1.0, perimeter * 0.003))
+        approx = cv2.approxPolyDP(c, epsilon, False)
+        
+        # 8. Single-Stroke Enforcement (Plotter Lifesaver)
+        # findContours traces the *perimeter* of a 1-pixel Canny line, creating a closed loop.
+        # If it's a collapsed loop, slice the array in half to trace it exactly once.
+        if cv2.contourArea(c) < perimeter * 1.5:
+            approx = approx[:max(2, len(approx) // 2 + 1)]
+        
+        # Need at least 3 points to curve smooth
+        if len(approx) < 3:
+            if len(approx) == 2:
+                paths.append([(float(approx[0][0][0]), float(approx[0][0][1])),
+                              (float(approx[1][0][0]), float(approx[1][0][1]))])
             continue
 
         pts = approx.reshape(-1, 2).astype(np.float32)
 
-        # ---------------------------------------------------
-        # CHAikin SMOOTHING
-        # ---------------------------------------------------
-
-        if len(pts) >= 3:
-
-            for _ in range(2):
-
-                p0 = pts[:-1]
-                p1 = pts[1:]
-
-                q = 0.75 * p0 + 0.25 * p1
-                r = 0.25 * p0 + 0.75 * p1
-
-                new_pts = np.empty(
-                    (len(p0) * 2, 2),
-                    dtype=np.float32
-                )
-
-                new_pts[0::2] = q
-                new_pts[1::2] = r
-
-                pts = np.vstack(
-                    (
-                        pts[0],
-                        new_pts,
-                        pts[-1]
-                    )
-                )
-
-        # ---------------------------------------------------
-        # SCALE BACK TO ORIGINAL IMAGE SIZE
-        # ---------------------------------------------------
-
-        pts[:, 0] /= scale
-        pts[:, 1] /= scale
-
-        paths.append(
-            [
-                (float(x), float(y))
-                for x, y in pts
-            ]
-        )
-
-    # -------------------------------------------------------
-    # SORT BY LENGTH
-    # -------------------------------------------------------
-
-    paths.sort(
-        key=len,
-        reverse=True
-    )
-
-    # -------------------------------------------------------
-    # STITCH NEARBY PATHS
-    # -------------------------------------------------------
-
-    paths = stitch_paths(
-        paths,
-        max_gap=25
-    )
+        # 9. Vectorized Chaikin's Corner Cutting
+        # Translates sharp, jagged polygon segments into natural, flowing Bezier-like curves.
+        for _ in range(2): 
+            p0 = pts[:-1]
+            p1 = pts[1:]
+            
+            # Interpolate at 25% and 75%
+            q = 0.75 * p0 + 0.25 * p1
+            r = 0.25 * p0 + 0.75 * p1
+            
+            # Interleave
+            new_pts = np.empty((len(p0) * 2, 2), dtype=np.float32)
+            new_pts[0::2] = q
+            new_pts[1::2] = r
+            
+            # Reattach endpoints
+            pts = np.vstack((pts[0], new_pts, pts[-1]))
+            
+        # Append to paths list as standard python floats (easily consumable by SVG/GCODE generators)
+        paths.append([(float(x), float(y)) for x, y in pts])
 
     return paths
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 2.  Hatching
 # ─────────────────────────────────────────────────────────────────────────────
