@@ -77,31 +77,31 @@ def _edge_contour(img_gray, h, w, spacing, density, start_t):
     """
     Improvements
     ─────────────
-    • CLAHE (Adaptive Histogram Equalization) pulls beautiful edge details out of deep shadows and bright highlights.
-    • Bilateral filter tuned to preserve fine textures (like hair/fabric) while still killing sensor noise.
-    • Morphological Closing bridges 1-px gaps, yielding much longer, continuous, flowing strokes instead of fragmented dots.
-    • Dynamic Douglas-Peucker smoothing: epsilon scales with contour length for organic, natural-looking curves.
+    • Speed/Edge Optimization: Switched to GaussianBlur + CLAHE. It's faster than 
+      Bilateral and produces more contiguous, flowing edge lines.
+    • True Curves: Implemented vectorized Chaikin's Corner Cutting Algorithm. 
+      This mathematically turns sharp polygons into buttery-smooth flowing curves.
     """
-    # 1. Local contrast enhancement (reveals hidden edges in dark/bright zones)
+    # 1. Local contrast enhancement to expose edges in shadows/highlights
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(img_gray)
 
-    # 2. Preserve main edges while smoothing out background noise
-    smooth = cv2.bilateralFilter(enhanced, d=5, sigmaColor=35, sigmaSpace=35)
+    # 2. Gaussian blur is fast and merges tiny noise into solid, drawable strokes
+    blur = cv2.GaussianBlur(enhanced, (5, 5), 0)
 
     # 3. Adaptive Canny: thresholds scale with image brightness
-    med = float(np.median(smooth))
+    med = float(np.median(blur))
     lo  = max(10,  int(0.66 * med))
     hi  = min(255, int(1.33 * med))
-    edges = cv2.Canny(smooth, lo, hi)
+    edges = cv2.Canny(blur, lo, hi)
 
-    # 4. Connect fragmented line segments (makes lines longer and more fluid)
+    # 4. Connect fragmented line segments into longer continuous strokes
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
 
     cnts, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
-    min_len = max(10, (h + w) // 150)        # Scale guard to image size
+    min_len = max(15, (h + w) // 120)        # Drop garbage specs, keeps plot clean
     paths = []
 
     for c in cnts:
@@ -109,12 +109,39 @@ def _edge_contour(img_gray, h, w, spacing, density, start_t):
         if perimeter < min_len:
             continue
             
-        # 5. Dynamic smoothing: slightly more smoothing for long sweeping curves, less for sharp tiny details
-        epsilon = min(1.5, max(0.5, perimeter * 0.005))
+        # 5. Simplify first (removes pixel staircasing, creates a sparse polygon)
+        epsilon = min(2.0, max(0.8, perimeter * 0.005))
         approx = cv2.approxPolyDP(c, epsilon, False)
         
-        if len(approx) >= 2:
-            paths.append([(float(p[0][0]), float(p[0][1])) for p in approx])
+        # Need at least 3 points for Chaikin's curve smoothing
+        if len(approx) < 3:
+            if len(approx) == 2:
+                paths.append([(float(approx[0][0][0]), float(approx[0][0][1])),
+                              (float(approx[1][0][0]), float(approx[1][0][1]))])
+            continue
+
+        # Extract points into an Nx2 float array
+        pts = approx.reshape(-1, 2).astype(np.float32)
+
+        # 6. Chaikin's Corner Cutting (Vectorized)
+        # Slices sharp corners off the polygon to create a perfectly smooth, organic curve
+        for _ in range(2):  # 2 iterations turns polygons into beautiful bezier-like curves
+            p0 = pts[:-1]
+            p1 = pts[1:]
+            
+            # Interpolate new points at 25% and 75% along each segment
+            q = 0.75 * p0 + 0.25 * p1
+            r = 0.25 * p0 + 0.75 * p1
+            
+            # Interleave the arrays
+            new_pts = np.empty((len(p0) * 2, 2), dtype=np.float32)
+            new_pts[0::2] = q
+            new_pts[1::2] = r
+            
+            # Reattach endpoints to preserve the full length of the stroke
+            pts = np.vstack((pts[0], new_pts, pts[-1]))
+            
+        paths.append([(float(x), float(y)) for x, y in pts])
 
     return paths
 
