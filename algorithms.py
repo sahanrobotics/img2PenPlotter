@@ -73,66 +73,49 @@ def process_algorithms(
 # 1.  Edge Contour
 # ─────────────────────────────────────────────────────────────────────────────
 
-import cv2
-import numpy as np
+
+
 
 def _edge_contour(img_gray, h, w, spacing, density, start_t):
     """
-    Advanced Dynamic Edge Art for Pen Plotters.
-    - Detail Level: Controlled dynamically via 'density' (0.0 to 1.0).
-    - Smoothness: Controlled dynamically via 'spacing' and Chaikin's iterations.
-    - Physics-Aware: Prevents plotter 'stutter' by removing micro-paths.
+    Controlled version:
+    - density: Adjusts the Canny threshold sensitivity (100-5000 scale).
+    - spacing: Adjusts the simplification detail (higher = smoother).
     """
     
-    # --- 1. DYNAMIC BRIGHTNESS & CONTRAST ---
-    # Normalize global range
-    img = cv2.normalize(img_gray, None, 0, 255, cv2.NORM_MINMAX)
-    
-    # Use 'density' to set the CLAHE clip limit (0.5 to 3.0)
-    # Higher density = more features extracted from highlights/shadows
-    dynamic_clip = 0.5 + (density * 2.5) 
-    clahe = cv2.createCLAHE(clipLimit=dynamic_clip, tileGridSize=(8, 8))
-    img = clahe.apply(img)
+    # 1. Normalization
+    img_gray = cv2.normalize(img_gray, None, 0, 255, cv2.NORM_MINMAX)
 
-    # --- 2. ADVANCED NOISE SUPPRESSION ---
-    # sigmaColor controls how much detail is merged. 
-    # We link it to density: Higher density = smaller sigma (preserves more detail)
-    sig_color = 100 - (density * 70) 
-    blurred = cv2.bilateralFilter(img, d=5, sigmaColor=sig_color, sigmaSpace=50)
+    # 2. Detail Management: Median blur intensity linked to spacing
+    blur_k = max(3, (int(spacing) // 4) * 2 + 1)
+    blurred = cv2.medianBlur(img_gray, blur_k)
 
-    # --- 3. STATISTICAL DYNAMIC CANNY ---
-    med = np.median(blurred)
-    std = np.std(blurred)
-    
-    # High density narrows the gap, forcing more lines to appear.
-    # Low density widens the gap, allowing only the strongest edges.
-    lower = int(max(0, (1.0 - (0.3 + density * 0.2)) * med))
-    upper = int(min(255, (1.0 + (0.3 + density * 0.2)) * med))
+    # 3. Adaptive Canny Thresholding: Use 'density' to control sensitivity
+    # Lower density = more sensitive (pick up faint edges), Higher = strict
+    v = np.median(blurred)
+    # Map density (100-5000) to a reasonable range for sigma/thresholds
+    sens = 1.0 - (density / 6000.0) 
+    lower = int(max(10, (1.0 - 0.33) * v * sens))
+    upper = int(min(255, (1.0 + 0.33) * v * (2.0 - sens)))
     edges = cv2.Canny(blurred, lower, upper)
 
-    # --- 4. MORPHOLOGICAL REFINEMENT ---
-    # Close small gaps to ensure long, continuous pen paths
-    kernel_size = 3 if density < 0.5 else 2
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    # 4. Cleanup
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
     edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
 
-    # --- 5. CONTOUR EXTRACTION & FILTERING ---
+    # 5. Extract Contours
     cnts, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
-    # Dynamic Path Rejection: 
-    # High density allows shorter strokes; low density keeps only major lines.
-    min_len = max(10, (h + w) // (80 + int(density * 100)))
-    
+    min_len = max(20, (h + w) // 100)
     paths = []
+
     for c in cnts:
         perimeter = cv2.arcLength(c, True)
         if perimeter < min_len:
             continue
             
-        # Dynamic Simplification (Epsilon)
-        # Linked to spacing: larger spacing means the pen shouldn't wiggle as much
-        eps_factor = 0.001 + (spacing * 0.002)
-        epsilon = min(2.0, max(0.5, perimeter * eps_factor))
+        # 6. Simplify: Use spacing as the base for corner cutting (higher = smoother)
+        epsilon = max(0.5, (spacing * 0.1) * (perimeter * 0.002))
         approx = cv2.approxPolyDP(c, epsilon, False)
         
         if len(approx) < 3:
@@ -143,14 +126,12 @@ def _edge_contour(img_gray, h, w, spacing, density, start_t):
 
         pts = approx.reshape(-1, 2).astype(np.float32)
 
-        # --- 6. VECTORIZED CHAIKIN'S SMOOTHING ---
-        # 3 iterations for "Buttery Smooth" curves.
-        for _ in range(3): 
+        # 7. Chaikin's Corner Cutting
+        for _ in range(2): 
             p0 = pts[:-1]
             p1 = pts[1:]
             q = 0.75 * p0 + 0.25 * p1
             r = 0.25 * p0 + 0.75 * p1
-            
             new_pts = np.empty((len(p0) * 2, 2), dtype=np.float32)
             new_pts[0::2] = q
             new_pts[1::2] = r
@@ -159,6 +140,8 @@ def _edge_contour(img_gray, h, w, spacing, density, start_t):
         paths.append([(float(x), float(y)) for x, y in pts])
 
     return paths
+
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2.  Hatching
