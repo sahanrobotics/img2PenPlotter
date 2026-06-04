@@ -77,44 +77,31 @@ def _edge_contour(img_gray, h, w, spacing, density, start_t):
     """
     Improvements
     ─────────────
-    • Reduced Detail: Using a stronger 5x5 blur and higher Canny thresholds to 
-      ignore noise and micro-textures, focusing only on main forms.
-    • Cleanliness: Morphological Opening deletes small 'specks' before tracing.
-    • Anti-Overlap: Thinning (Skeletonization) ensures single-pixel lines only.
-    • Chaikin Curve Smoothing: Keeps the final strokes fluid and organic.
+    • Speed/Edge Optimization: Switched to GaussianBlur + CLAHE. It's faster than 
+      Bilateral and produces more contiguous, flowing edge lines.
+    • True Curves: Implemented vectorized Chaikin's Corner Cutting Algorithm. 
+      This mathematically turns sharp polygons into buttery-smooth flowing curves.
     """
-    # 1. Stronger Blur to suppress high-frequency detail/noise
-    blur = cv2.GaussianBlur(img_gray, (5, 5), 0)
-    
-    # 2. Conservative Canny thresholds (ignoring weak edges)
+    # 1. Local contrast enhancement to expose edges in shadows/highlights
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(img_gray)
+
+    # 2. Gaussian blur is fast and merges tiny noise into solid, drawable strokes
+    blur = cv2.GaussianBlur(enhanced, (5, 5), 0)
+
+    # 3. Adaptive Canny: thresholds scale with image brightness
     med = float(np.median(blur))
-    lo  = max(40,  int(0.75 * med)) # Higher floor to kill low-contrast noise
-    hi  = min(255, int(1.50 * med))
+    lo  = max(10,  int(0.66 * med))
+    hi  = min(255, int(1.33 * med))
     edges = cv2.Canny(blur, lo, hi)
 
-    # 3. Clean up specks (Morphological Opening)
-    kernel_small = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-    edges = cv2.morphologyEx(edges, cv2.MORPH_OPEN, kernel_small)
+    # 4. Connect fragmented line segments into longer continuous strokes
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
 
-    # 4. Anti-Overlap: Thinning (Skeletonization) 
-    # Ensures a single stroke instead of double-tracing an edge.
-    temp_edges = edges.copy()
-    skeleton = np.zeros(edges.shape, np.uint8)
-    element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
-    
-    for _ in range(4): # 4 passes is usually enough for single-px skeleton
-        eroded = cv2.erode(temp_edges, element)
-        temp = cv2.dilate(eroded, element)
-        temp = cv2.subtract(temp_edges, temp)
-        skeleton = cv2.bitwise_or(skeleton, temp)
-        temp_edges = eroded.copy()
-        if cv2.countNonZero(temp_edges) == 0: break
+    cnts, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
-    # 5. Find Contours
-    cnts, _ = cv2.findContours(skeleton, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    # Filter out short segments (increased threshold for 'cleaner' look)
-    min_len = max(20, (h + w) // 100) 
+    min_len = max(15, (h + w) // 120)        # Drop garbage specs, keeps plot clean
     paths = []
 
     for c in cnts:
@@ -122,24 +109,36 @@ def _edge_contour(img_gray, h, w, spacing, density, start_t):
         if perimeter < min_len:
             continue
             
-        # Simplify geometry
+        # 5. Simplify first (removes pixel staircasing, creates a sparse polygon)
         epsilon = min(2.0, max(0.8, perimeter * 0.005))
         approx = cv2.approxPolyDP(c, epsilon, False)
         
+        # Need at least 3 points for Chaikin's curve smoothing
         if len(approx) < 3:
             if len(approx) == 2:
                 paths.append([(float(approx[0][0][0]), float(approx[0][0][1])),
                               (float(approx[1][0][0]), float(approx[1][0][1]))])
             continue
 
+        # Extract points into an Nx2 float array
         pts = approx.reshape(-1, 2).astype(np.float32)
 
-        # 6. Chaikin Curve Smoothing
-        for _ in range(2): 
-            p0, p1 = pts[:-1], pts[1:]
-            q, r = 0.75 * p0 + 0.25 * p1, 0.25 * p0 + 0.75 * p1
+        # 6. Chaikin's Corner Cutting (Vectorized)
+        # Slices sharp corners off the polygon to create a perfectly smooth, organic curve
+        for _ in range(2):  # 2 iterations turns polygons into beautiful bezier-like curves
+            p0 = pts[:-1]
+            p1 = pts[1:]
+            
+            # Interpolate new points at 25% and 75% along each segment
+            q = 0.75 * p0 + 0.25 * p1
+            r = 0.25 * p0 + 0.75 * p1
+            
+            # Interleave the arrays
             new_pts = np.empty((len(p0) * 2, 2), dtype=np.float32)
-            new_pts[0::2], new_pts[1::2] = q, r
+            new_pts[0::2] = q
+            new_pts[1::2] = r
+            
+            # Reattach endpoints to preserve the full length of the stroke
             pts = np.vstack((pts[0], new_pts, pts[-1]))
             
         paths.append([(float(x), float(y)) for x, y in pts])
