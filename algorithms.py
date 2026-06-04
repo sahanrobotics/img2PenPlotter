@@ -113,6 +113,14 @@ def _edge_contour(img_gray, h, w, spacing, density, start_t):
         epsilon = min(2.0, max(0.8, perimeter * 0.005))
         approx = cv2.approxPolyDP(c, epsilon, False)
         
+        # --- REDUCE DOUBLE LINES ---
+        # Traced strokes map out a closed loop going down one side and back up the other.
+        # If the area vs perimeter indicates it's just a collapsed loop (a line), slice 
+        # the array in half to only draw one side, completely eliminating the double line.
+        if cv2.contourArea(c) < perimeter * 2.0:
+            approx = approx[:max(2, len(approx) // 2 + 1)]
+        # ---------------------------
+        
         # Need at least 3 points for Chaikin's curve smoothing
         if len(approx) < 3:
             if len(approx) == 2:
